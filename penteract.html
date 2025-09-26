@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Penteract (5D hypercube) → 3D canvas with shadows</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      html, body {
+        height: 100%;
+        margin: 0;
+        background: #0b0e13;
+        color: #cbd5e1;
+        font-family:
+          ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial;
+      }
+      #app {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        grid-template-rows: 1fr auto;
+      }
+      canvas {
+        display: block;
+        outline: none;
+      }
+      .footer {
+        padding: 8px 12px;
+        font-size: 12px;
+        letter-spacing: 0.2px;
+        color: #9aa7b4;
+        background: linear-gradient(
+          180deg,
+          rgba(11, 14, 19, 0) 0%,
+          rgba(11, 14, 19, 0.7) 30%,
+          rgba(11, 14, 19, 1) 100%
+        );
+        text-align: center;
+        user-select: none;
+      }
+      .hint {
+        color: #a5b4fc;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="c"></canvas>
+      <div class="footer">
+        Drag to orbit • Mouse wheel to zoom • <span class="hint"
+        >Use the GUI (top-right) to tweak 5D rotations & projection</span>
+      </div>
+    </div>
+
+    <script type="module">
+      /* -------------------------------------------------------------
+   Imports (ESM via CDN)
+-------------------------------------------------------------- */
+      import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+      import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19/dist/lil-gui.esm.min.js";
+
+      /* -------------------------------------------------------------
+   Scene, Renderer, Camera
+-------------------------------------------------------------- */
+      const canvas = document.getElementById("c");
+      const renderer = new THREE.WebGLRenderer({
+        canvas,
+        antialias: true,
+        alpha: false,
+        powerPreference: "high-performance",
+      });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0b0e13);
+
+      const camera = new THREE.PerspectiveCamera(
+        55,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        100,
+      );
+      camera.position.set(4.2, 2.7, 5.6);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.06;
+      controls.minDistance = 2.5;
+      controls.maxDistance = 20;
+
+      /* -------------------------------------------------------------
+   Lights & Shadow Receiver
+-------------------------------------------------------------- */
+      scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+      const dirLight = new THREE.DirectionalLight(0xffffff, 1.1);
+      dirLight.position.set(6, 8, 4);
+      dirLight.castShadow = true;
+      dirLight.shadow.mapSize.set(2048, 2048);
+      dirLight.shadow.camera.near = 1;
+      dirLight.shadow.camera.far = 30;
+      dirLight.shadow.camera.left = -10;
+      dirLight.shadow.camera.right = 10;
+      dirLight.shadow.camera.top = 10;
+      dirLight.shadow.camera.bottom = -10;
+      scene.add(dirLight);
+
+      const ground = new THREE.Mesh(
+        new THREE.PlaneGeometry(40, 40),
+        new THREE.MeshStandardMaterial({
+          color: 0x0d1117,
+          roughness: 0.95,
+          metalness: 0.0,
+        }),
+      );
+      ground.rotation.x = -Math.PI / 2;
+      ground.position.y = -1.2;
+      ground.receiveShadow = true;
+      scene.add(ground);
+
+      /* -------------------------------------------------------------
+   5D Hypercube (Penteract) Data
+   - 32 vertices = 2^5
+   - 80 edges = 5 * 2^(5-1)
+-------------------------------------------------------------- */
+      const N = 5; // dimensions
+      const SIZE = 1.0; // half-extent per axis before projection
+
+      // vertices in 5D as arrays [x,y,z,w,v] with coordinates ±SIZE
+      const vertices5D = [];
+      for (let i = 0; i < (1 << N); i++) {
+        const v = new Array(N);
+        for (let d = 0; d < N; d++) {
+          v[d] = ((i >> d) & 1) ? SIZE : -SIZE;
+        }
+        vertices5D.push(v);
+      }
+
+      // edges: connect pairs that differ by exactly one bit
+      const edges = [];
+      for (let i = 0; i < (1 << N); i++) {
+        for (let d = 0; d < N; d++) {
+          const j = i ^ (1 << d);
+          if (j > i) edges.push([i, j]);
+        }
+      }
+      // Sanity: 32 verts, 80 edges
+      // console.log(vertices5D.length, edges.length);
+
+      /* -------------------------------------------------------------
+   5D Rotation + Projection (5D→4D→3D perspective)
+   Rotations in 10 independent planes:
+     [XY, XZ, XW, XV, YZ, YW, YV, ZW, ZV, WV]
+-------------------------------------------------------------- */
+      const planes = [
+        ["X", "Y"],
+        ["X", "Z"],
+        ["X", "W"],
+        ["X", "V"],
+        ["Y", "Z"],
+        ["Y", "W"],
+        ["Y", "V"],
+        ["Z", "W"],
+        ["Z", "V"],
+        ["W", "V"],
+      ];
+      const axisIndex = { X: 0, Y: 1, Z: 2, W: 3, V: 4 };
+
+      const params = {
+        autoSpin: true,
+        spinSpeed: 0.6, // radians/sec applied across all planes
+        thickness: 0.035, // edge cylinder radius
+        vertexSize: 0.06, // vertex sphere radius
+        fw: 3.2, // focal length for 4D→3D (W perspective)
+        fv: 5.0, // focal length for 5D→4D (V perspective)
+        brighten: 1.0, // line brightness multiplier
+        lineAlpha: 0.9, // line opacity
+        showCylinders: true, // shadow-casting edges
+        showLines: true, // crisp overlay lines
+        showVertices: true, // vertex spheres (cast nice shadows)
+        // Per-plane angles and speeds
+        angles: Object.fromEntries(
+          planes.map(([a, b]) => [`${a}${b}`, 0.0]),
+        ),
+        speeds: Object.fromEntries(
+          planes.map(([a, b]) => [`${a}${b}`, 1.0]),
+        ),
+      };
+
+      function rotateInPlane(vec, i, j, theta) {
+        const ci = vec[i], cj = vec[j];
+        const c = Math.cos(theta), s = Math.sin(theta);
+        vec[i] = ci * c - cj * s;
+        vec[j] = ci * s + cj * c;
+      }
+
+      // Apply all 10 plane rotations to a 5D vector (in-place on a temp copy)
+      function applyRotations5D(out, src) {
+        for (let d = 0; d < 5; d++) out[d] = src[d];
+        for (const [A, B] of planes) {
+          const key = `${A}${B}`;
+          const i = axisIndex[A], j = axisIndex[B];
+          rotateInPlane(out, i, j, params.angles[key]);
+        }
+        return out;
+      }
+
+      // Project 5D→3D with two-step perspective (V then W)
+      function project5Dto3D(p5) {
+        // Step 1: 5D→4D using V as depth
+        const v = p5[4];
+        const sv = params.fv / (params.fv - v);
+        const x4 = p5[0] * sv,
+          y4 = p5[1] * sv,
+          z4 = p5[2] * sv,
+          w4 = p5[3] * sv;
+        // Step 2: 4D→3D using W as depth
+        const sw = params.fw / (params.fw - w4);
+        return new THREE.Vector3(x4 * sw, y4 * sw, z4 * sw);
+      }
+
+      /* -------------------------------------------------------------
+   Geometries & Instanced meshes
+   - Crisp line overlay (does NOT cast shadows)
+   - Thin cylinder instances (cast shadows)
+   - Vertex sphere instances (cast shadows)
+-------------------------------------------------------------- */
+      // Lines (overlay)
+      const linePositions = new Float32Array(edges.length * 2 * 3);
+      const lineGeom = new THREE.BufferGeometry();
+      lineGeom.setAttribute(
+        "position",
+        new THREE.BufferAttribute(linePositions, 3),
+      );
+      const lineMat = new THREE.LineBasicMaterial({
+        color: 0x93c5fd,
+        transparent: true,
+        opacity: params.lineAlpha,
+      });
+      const lineSegments = new THREE.LineSegments(lineGeom, lineMat);
+      lineSegments.visible = params.showLines;
+      scene.add(lineSegments);
+
+      // Edge cylinders (instanced, shadow-casting)
+      const cylGeom = new THREE.CylinderGeometry(1, 1, 1, 10, 1, true);
+      const cylMat = new THREE.MeshStandardMaterial({
+        color: 0x93c5fd,
+        roughness: 0.6,
+        metalness: 0.2,
+      });
+      const edgeCylinders = new THREE.InstancedMesh(
+        cylGeom,
+        cylMat,
+        edges.length,
+      );
+      edgeCylinders.castShadow = true;
+      edgeCylinders.receiveShadow = false;
+      edgeCylinders.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      edgeCylinders.visible = params.showCylinders;
+      scene.add(edgeCylinders);
+
+      // Vertex spheres (instanced, shadow-casting)
+      const sphGeom = new THREE.SphereGeometry(1, 20, 16);
+      const sphMat = new THREE.MeshStandardMaterial({
+        color: 0xe5e7eb,
+        roughness: 0.8,
+        metalness: 0.1,
+      });
+      const vertexSpheres = new THREE.InstancedMesh(
+        sphGeom,
+        sphMat,
+        vertices5D.length,
+      );
+      vertexSpheres.castShadow = true;
+      vertexSpheres.receiveShadow = false;
+      vertexSpheres.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      vertexSpheres.visible = params.showVertices;
+      scene.add(vertexSpheres);
+
+      // Per-instance colors (optional: encode by W/V to hint depth)
+      const tmpColor = new THREE.Color();
+      function colorFor5D(p5) {
+        // HSL based on W and V to make 5D depth "legible"
+        const hue = (p5[3] + 2.5) / 5.0; // W in [-1,1] mapped ~[0.3..0.7]
+        const light = 0.55 + 0.25 * (p5[4] / 1.0); // V influences lightness a bit
+        tmpColor.setHSL(
+          THREE.MathUtils.euclideanModulo(hue, 1),
+          0.6,
+          THREE.MathUtils.clamp(light, 0.35, 0.85),
+        );
+        return tmpColor;
+      }
+
+      /* -------------------------------------------------------------
+   Update loop: rotate 5D → project → update instances + lines
+-------------------------------------------------------------- */
+      const temp5 = new Array(5);
+      const rotated = new Array(5);
+      const projected = vertices5D.map((_) => new THREE.Vector3());
+
+      function updateGeometry() {
+        // 1) Vertex projections (also update instance transforms for spheres)
+        const m = new THREE.Matrix4();
+        const q = new THREE.Quaternion();
+        const s = new THREE.Vector3(1, 1, 1);
+
+        for (let i = 0; i < vertices5D.length; i++) {
+          // rotate
+          applyRotations5D(rotated, vertices5D[i]);
+          // store a tiny "brighten" factor on lines via color change (optional)
+          const pos3 = project5Dto3D(rotated);
+          projected[i].copy(pos3);
+
+          // vertex spheres
+          s.set(
+            params.vertexSize,
+            params.vertexSize,
+            params.vertexSize,
+          );
+          q.identity();
+          m.compose(pos3, q, s);
+          vertexSpheres.setMatrixAt(i, m);
+
+          // color by W,V
+          vertexSpheres.setColorAt(i, colorFor5D(rotated).clone());
+        }
+        vertexSpheres.instanceColor &&
+          (vertexSpheres.instanceColor.needsUpdate = true);
+        vertexSpheres.instanceMatrix.needsUpdate = true;
+
+        // 2) Lines & cylinders for edges
+        const up = new THREE.Vector3(0, 1, 0);
+        const scale = new THREE.Vector3(1, 1, 1);
+        let li = 0;
+        for (let e = 0; e < edges.length; e++) {
+          const [aIdx, bIdx] = edges[e];
+          const a = projected[aIdx], b = projected[bIdx];
+
+          // Lines (overlay)
+          linePositions[li++] = a.x;
+          linePositions[li++] = a.y;
+          linePositions[li++] = a.z;
+          linePositions[li++] = b.x;
+          linePositions[li++] = b.y;
+          linePositions[li++] = b.z;
+
+          // Cylinders (shadow-casting thin tubes)
+          const mid = new THREE.Vector3().addVectors(a, b)
+            .multiplyScalar(0.5);
+          const dir = new THREE.Vector3().subVectors(b, a);
+          const len = dir.length();
+          if (len > 1e-6) {
+            const quat = new THREE.Quaternion().setFromUnitVectors(
+              up,
+              dir.clone().normalize(),
+            );
+            scale.set(params.thickness, len, params.thickness); // cylinder axis is Y, height=1 → scale.y=len
+            const mat = new THREE.Matrix4().compose(mid, quat, scale);
+            edgeCylinders.setMatrixAt(e, mat);
+            edgeCylinders.setColorAt(
+              e,
+              colorFor5D(rotated).clone().multiplyScalar(
+                params.brighten,
+              ),
+            );
+          }
+        }
+        lineGeom.attributes.position.needsUpdate = true;
+        edgeCylinders.instanceColor &&
+          (edgeCylinders.instanceColor.needsUpdate = true);
+        edgeCylinders.instanceMatrix.needsUpdate = true;
+      }
+
+      /* -------------------------------------------------------------
+   GUI
+-------------------------------------------------------------- */
+      const gui = new GUI({ title: "Penteract Controls" });
+      gui.domElement.style.userSelect = "none";
+      const gAnim = gui.addFolder("Animation");
+      gAnim.add(params, "autoSpin").name("Auto-spin");
+      gAnim.add(params, "spinSpeed", 0, 2.5, 0.01).name("Spin speed");
+
+      const gProj = gui.addFolder("Projection");
+      gProj.add(params, "fw", 1.5, 8.0, 0.01).name("W focal (4D→3D)");
+      gProj.add(params, "fv", 1.5, 10.0, 0.01).name("V focal (5D→4D)");
+
+      const gStyle = gui.addFolder("Style");
+      gStyle.add(params, "thickness", 0.005, 0.15, 0.001).name(
+        "Edge thickness",
+      );
+      gStyle.add(params, "vertexSize", 0.02, 0.2, 0.001).name(
+        "Vertex size",
+      );
+      gStyle.add(params, "lineAlpha", 0.0, 1.0, 0.01).name(
+        "Line opacity",
+      ).onChange((v) => {
+        lineMat.opacity = v;
+      });
+      gStyle.addColor({ lineColor: "#93c5fd" }, "lineColor").name(
+        "Line color",
+      ).onChange((v) => {
+        lineMat.color.set(v);
+        cylMat.color.set(v);
+      });
+      gStyle.add(params, "brighten", 0.4, 2.0, 0.01).name(
+        "Color intensity",
+      );
+      gStyle.add(params, "showLines").name("Show overlay lines")
+        .onChange((v) => {
+          lineSegments.visible = v;
+        });
+      gStyle.add(params, "showCylinders").name("Show cylinders")
+        .onChange((v) => {
+          edgeCylinders.visible = v;
+        });
+      gStyle.add(params, "showVertices").name("Show vertices").onChange(
+        (v) => {
+          vertexSpheres.visible = v;
+        },
+      );
+
+      const gAngles = gui.addFolder("5D Rotation Angles (rad)");
+      for (const [A, B] of planes) {
+        gAngles.add(params.angles, `${A}${B}`, -Math.PI, Math.PI, 0.001)
+          .name(`${A}${B}`);
+      }
+
+      const gSpeeds = gui.addFolder("Per-plane Spin Weight");
+      for (const [A, B] of planes) {
+        gSpeeds.add(params.speeds, `${A}${B}`, -2.0, 2.0, 0.01).name(
+          `${A}${B}`,
+        );
+      }
+
+      /* -------------------------------------------------------------
+   Render loop
+-------------------------------------------------------------- */
+      let lastT = performance.now();
+      function animate() {
+        const now = performance.now();
+        const dt = Math.min(0.05, (now - lastT) / 1000);
+        lastT = now;
+
+        if (params.autoSpin) {
+          const base = params.spinSpeed * dt;
+          // Distribute spin across planes using user-set weights
+          for (const [A, B] of planes) {
+            const key = `${A}${B}`;
+            params.angles[key] += base * params.speeds[key];
+          }
+        }
+
+        updateGeometry();
+        controls.update();
+        renderer.render(scene, camera);
+        requestAnimationFrame(animate);
+      }
+      updateGeometry();
+      animate();
+
+      /* -------------------------------------------------------------
+   Resize handling
+-------------------------------------------------------------- */
+      window.addEventListener("resize", () => {
+        const w = window.innerWidth, h = window.innerHeight;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+      });
+    </script>
+  </body>
+</html>
